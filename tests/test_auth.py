@@ -18,7 +18,7 @@ from app.database import db_instance
 # ==========================================
 class MockAsyncCollection:
     def __init__(self):
-        self.store =[]
+        self.store = []
 
     async def find_one(self, query, *args, **kwargs):
         for doc in self.store:
@@ -27,11 +27,18 @@ class MockAsyncCollection:
         return None
 
     async def insert_one(self, document):
-        # Simulate composite unique index (user_id, nonce)
-        if "nonce" in document and "user_id" in document:
+        # Simulate unique constraints accurately for different collections
+        if "nonce" in document:
+            # Simulate composite unique index for used_nonces_collection
             for doc in self.store:
                 if doc.get("nonce") == document["nonce"] and doc.get("user_id") == document["user_id"]:
                     raise DuplicateKeyError("E11000 duplicate key error")
+        else:
+            # Simulate unique index on user_id for users_collection
+            for doc in self.store:
+                if doc.get("user_id") == document["user_id"]:
+                    raise DuplicateKeyError("E11000 duplicate key error")
+                    
         self.store.append(document)
         class InsertOneResult:
             inserted_id = "mock_id"
@@ -87,6 +94,15 @@ def test_register_success():
     _, public_pem = generate_test_keypair()
     resp = client.post("/auth/register", json={"public_key": public_pem})
     assert resp.status_code == 201
+
+def test_register_duplicate():
+    _, public_pem = generate_test_keypair()
+    resp1 = client.post("/auth/register", json={"public_key": public_pem})
+    assert resp1.status_code == 201
+    
+    resp2 = client.post("/auth/register", json={"public_key": public_pem})
+    assert resp2.status_code == 400
+    assert resp2.json()["detail"] == "Public key already registered"
 
 def test_register_ec_key_rejected():
     ec_priv = ec.generate_private_key(ec.SECP256R1())
