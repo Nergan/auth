@@ -1,28 +1,90 @@
+import base64
+import binascii
+import time
 from datetime import datetime, timezone
-from fastapi import APIRouter, HTTPException, status
-from pymongo.errors import DuplicateKeyError
-from app.models import UserRegister, UserResponse
-from app.database import db_instance
-from app.security import generate_user_id
+from fastapi import APIRouter, status
+
+from app.config import settings
+from app.domain.models import UserRegister, UserResponse, UserEntity
+from app.domain.crypto_core import generate_user_id, build_registration_challenge
+from app.domain.exceptions import (
+    KeyValidationError,
+    TimestampExpiredError,
+    SignatureVerificationError,
+    UnsupportedAlgorithmError,
+    UserAlreadyExistsError,
+    RegistrationNonceReusedError
+)
+from app.infrastructure.crypto_service import crypto_service
+from app.infrastructure.repositories import user_repository, nonce_manager
 
 router = APIRouter(prefix="/auth", tags=["Authentication"])
 
+
 @router.post("/register", status_code=status.HTTP_201_CREATED, response_model=UserResponse)
 async def register(user_data: UserRegister):
+    # 1. Freshness validation on registration challenge
+    current_time = int(time.time())
+    if abs(current_time - user_data.timestamp) > settings.timestamp_tolerance_seconds:
+        raise TimestampExpiredError("Registration timestamp expired or skewed")
+
+    # 2. Algorithm lookup & Structural Public Key Validation offloaded to worker pool
     try:
-        user_id = generate_user_id(user_data.public_key)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid public key format")
+        verifier = crypto_service.get_verifier(user_data.key_algorithm.value)
+    except UnsupportedAlgorithmError:
+        raise
 
     try:
-        await db_instance.users_collection.insert_one({
-            "user_id": user_id,
-            "public_key": user_data.public_key,
-            "created_at": datetime.now(timezone.utc)
-        })
-    except DuplicateKeyError:
-        raise HTTPException(status_code=400, detail="Public key already registered")
-    
+        parsed_key = await crypto_service.parse_public_key_async(user_data.key_algorithm.value, user_data.public_key)
+        canonical_bytes = await crypto_service.get_canonical_key_bytes_async(verifier, parsed_key)
+        user_id = generate_user_id(user_data.key_algorithm.value, canonical_bytes)
+    except KeyValidationError:
+        raise
+    except (ValueError, binascii.Error, TypeError) as exc:
+        raise KeyValidationError("Invalid public key format") from exc
+
+    # 3. Identity uniqueness check prior to asymmetric verification (DoS prevention)
+    existing_user = await user_repository.get_user_by_id(user_id)
+    if existing_user:
+        raise UserAlreadyExistsError("Public key already registered")
+
+    # 4. Gating: Reserve ephemeral registration nonce prior to expensive RSA signature verification
+    nonce_recorded = await nonce_manager.record_registration_nonce(user_id, user_data.client_nonce)
+    if not nonce_recorded:
+        raise RegistrationNonceReusedError("Registration challenge nonce has already been used")
+
+    # 5. Timestamped & Nonce-bound Proof of Possession Verification
+    challenge = build_registration_challenge(
+        user_data.key_algorithm.value, canonical_bytes, user_data.timestamp, user_data.client_nonce
+    )
+
+    try:
+        sig_bytes = base64.b64decode(user_data.proof_signature, validate=True)
+    except Exception as exc:
+        raise SignatureVerificationError("Invalid base64 signature encoding") from exc
+
+    try:
+        is_valid = await crypto_service.verify_signature_async(
+            verifier, parsed_key, challenge.encode("utf-8"), sig_bytes
+        )
+        if not is_valid:
+            raise SignatureVerificationError("Invalid proof of possession signature")
+    except SignatureVerificationError:
+        raise
+    except Exception as exc:
+        raise SignatureVerificationError("Proof of possession verification failed") from exc
+
+    # 6. Identity Persistence
+    user = UserEntity(
+        user_id=user_id,
+        public_key=user_data.public_key,
+        key_algorithm=user_data.key_algorithm,
+        nonce_base=0,
+        nonce_mask=0,
+        created_at=datetime.now(timezone.utc)
+    )
+
+    await user_repository.create_user(user)
+    crypto_service.key_cache.put(user_id, parsed_key)
+
     return UserResponse(user_id=user_id, message="Registration successful")
