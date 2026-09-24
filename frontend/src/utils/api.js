@@ -1,4 +1,4 @@
-import { signPayload, getStoredCounter, setStoredCounter, getAndIncrementCounter, generateRandomNonce } from './crypto.js';
+import { signPayload, setStoredCounter, getAndIncrementCounter, generateRandomNonce } from './crypto.js';
 
 export class LockTimeoutError extends Error {
     constructor(message = "CrossTabCounterMutex lock acquisition timeout") {
@@ -7,38 +7,14 @@ export class LockTimeoutError extends Error {
     }
 }
 
-function isLocalStorageAvailable() {
-    try {
-        if (typeof window === "undefined" || !window.localStorage) {
-            return false;
-        }
-        const testKey = "__storage_test__";
-        window.localStorage.setItem(testKey, "1");
-        window.localStorage.removeItem(testKey);
-        return true;
-    } catch {
-        return false;
-    }
-}
-
 class CrossTabCounterMutex {
-    constructor() {
-        this._taskQueue = [];
-        this._isProcessing = false;
-    }
-
     async acquireCounter(userId) {
         if (typeof navigator !== "undefined" && navigator.locks && navigator.locks.request) {
             return navigator.locks.request(`counter_lock_${userId}`, async () => {
                 return getAndIncrementCounter(userId);
             });
         }
-
-        return this._enqueue(userId, async () => {
-            return this._withCrossTabLock(userId, async () => {
-                return getAndIncrementCounter(userId);
-            });
-        });
+        return getAndIncrementCounter(userId);
     }
 
     async setCounter(userId, nextCounter) {
@@ -48,120 +24,34 @@ class CrossTabCounterMutex {
                 await setStoredCounter(userId, bigIntCounter);
             });
         }
-
-        return this._enqueue(userId, async () => {
-            return this._withCrossTabLock(userId, async () => {
-                await setStoredCounter(userId, bigIntCounter);
-            });
-        });
-    }
-
-    _enqueue(userId, task) {
-        return new Promise((resolve, reject) => {
-            this._taskQueue.push({ task, resolve, reject });
-            this._processQueue();
-        });
-    }
-
-    async _processQueue() {
-        if (this._isProcessing) return;
-        this._isProcessing = true;
-
-        while (this._taskQueue.length > 0) {
-            const item = this._taskQueue.shift();
-            try {
-                const result = await item.task();
-                item.resolve(result);
-            } catch (err) {
-                item.reject(err);
-            }
-        }
-
-        this._isProcessing = false;
-    }
-
-    async _withCrossTabLock(userId, action) {
-        if (!isLocalStorageAvailable()) {
-            return action();
-        }
-
-        const lockKey = `__tab_counter_lock_${userId}`;
-        const lockToken = Math.random().toString(36).substring(2) + Date.now().toString(36);
-        const lockTimeout = 5000;
-        const pollInterval = 25;
-        const maxWaitTime = 10000;
-        const startTime = Date.now();
-        let lockAcquired = false;
-
-        while (true) {
-            const now = Date.now();
-            let currentLock = null;
-
-            try {
-                currentLock = localStorage.getItem(lockKey);
-            } catch {
-                return action();
-            }
-
-            if (!currentLock) {
-                try {
-                    localStorage.setItem(lockKey, JSON.stringify({ token: lockToken, expires: now + lockTimeout }));
-                } catch {
-                    return action();
-                }
-
-                await new Promise(res => setTimeout(res, 5 + Math.floor(Math.random() * 15)));
-
-                try {
-                    const verify = JSON.parse(localStorage.getItem(lockKey) || "{}");
-                    if (verify.token === lockToken) {
-                        lockAcquired = true;
-                        break;
-                    }
-                } catch {
-                    // Retry on parse error
-                }
-            } else {
-                try {
-                    const parsed = JSON.parse(currentLock);
-                    if (parsed.expires && now > parsed.expires) {
-                        localStorage.removeItem(lockKey);
-                        continue;
-                    }
-                } catch {
-                    try {
-                        localStorage.removeItem(lockKey);
-                    } catch {
-                        return action();
-                    }
-                    continue;
-                }
-            }
-
-            if (now - startTime > maxWaitTime) {
-                throw new LockTimeoutError(`Failed to acquire cross-tab lock for user ${userId} within ${maxWaitTime}ms`);
-            }
-            await new Promise(res => setTimeout(res, pollInterval));
-        }
-
-        try {
-            return await action();
-        } finally {
-            if (lockAcquired) {
-                try {
-                    const existing = JSON.parse(localStorage.getItem(lockKey) || "{}");
-                    if (existing.token === lockToken) {
-                        localStorage.removeItem(lockKey);
-                    }
-                } catch {
-                    // Ignore storage release errors
-                }
-            }
-        }
+        await setStoredCounter(userId, bigIntCounter);
     }
 }
 
 const counterMutex = new CrossTabCounterMutex();
+
+export function normalizeContentType(contentType) {
+    if (!contentType) return "";
+    const parts = contentType.split(";").map(p => p.trim()).filter(Boolean);
+    if (parts.length === 0) return "";
+
+    const essence = parts[0].toLowerCase();
+    const params = [];
+
+    for (let i = 1; i < parts.length; i++) {
+        const param = parts[i];
+        if (param.includes("=")) {
+            const [k, ...v] = param.split("=");
+            params.push([k.trim().toLowerCase(), v.join("=").trim().replace(/^"|"$/g, '')]);
+        }
+    }
+
+    params.sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
+    if (params.length === 0) return essence;
+
+    const paramStr = params.map(([k, v]) => `${k}=${v}`).join(";");
+    return `${essence};${paramStr}`;
+}
 
 export function normalizeHost(host) {
     if (!host) return "";
@@ -173,9 +63,7 @@ export function normalizeHost(host) {
             const rest = clean.slice(closingIndex + 1);
             if (rest.startsWith(":")) {
                 const port = rest.slice(1);
-                if (port === "80" || port === "443") {
-                    return bracketed;
-                }
+                if (port === "80" || port === "443") return bracketed;
                 return `${bracketed}:${port}`;
             }
             return bracketed;
@@ -184,9 +72,7 @@ export function normalizeHost(host) {
         const parts = clean.split(":");
         if (parts.length === 2) {
             const [hostname, port] = parts;
-            if (port === "80" || port === "443") {
-                return hostname;
-            }
+            if (port === "80" || port === "443") return hostname;
         }
     }
     return clean;
@@ -198,29 +84,19 @@ export function removeDotSegments(path) {
     const output = [];
 
     while (input.length > 0) {
-        if (input.startsWith("../")) {
-            input = input.slice(3);
-        } else if (input.startsWith("./")) {
-            input = input.slice(2);
-        } else if (input.startsWith("/./")) {
-            input = "/" + input.slice(3);
-        } else if (input === "/.") {
-            input = "/";
-        } else if (input.startsWith("/../")) {
+        if (input.startsWith("../")) input = input.slice(3);
+        else if (input.startsWith("./")) input = input.slice(2);
+        else if (input.startsWith("/./")) input = "/" + input.slice(3);
+        else if (input === "/.") input = "/";
+        else if (input.startsWith("/../")) {
             input = "/" + input.slice(4);
             if (output.length > 0) output.pop();
         } else if (input === "/..") {
             input = "/";
             if (output.length > 0) output.pop();
-        } else if (input === "." || input === "..") {
-            input = "";
-        } else {
-            let nextSlash = -1;
-            if (input.startsWith("/")) {
-                nextSlash = input.indexOf("/", 1);
-            } else {
-                nextSlash = input.indexOf("/");
-            }
+        } else if (input === "." || input === "..") input = "";
+        else {
+            let nextSlash = input.startsWith("/") ? input.indexOf("/", 1) : input.indexOf("/");
             if (nextSlash !== -1) {
                 output.push(input.slice(0, nextSlash));
                 input = input.slice(nextSlash);
@@ -241,16 +117,12 @@ const UNRESERVED = new Set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz
 export function normalizePercentEncoding(str) {
     return str.replace(/%([0-9a-fA-F]{2})/g, (match, hex) => {
         const byteVal = parseInt(hex, 16);
-        if (UNRESERVED.has(byteVal)) {
-            return String.fromCharCode(byteVal);
-        }
-        return "%" + hex.toUpperCase();
+        return UNRESERVED.has(byteVal) ? String.fromCharCode(byteVal) : "%" + hex.toUpperCase();
     });
 }
 
 export function normalizePath(path) {
     if (!path) return "/";
-    // Canonical ordering: decode unreserved percent-encodings first before removing dot segments
     let normalized = normalizePercentEncoding(path.trim());
     normalized = removeDotSegments(normalized);
     normalized = normalized.replace(/\/+/g, "/");
@@ -262,99 +134,66 @@ export function rfc3986Encode(str) {
     return encodeURIComponent(str).replace(/[!'()*]/g, c => `%${c.charCodeAt(0).toString(16).toUpperCase()}`);
 }
 
-function codePointCompare(a, b) {
-    const cpA = Array.from(a).map(c => c.codePointAt(0));
-    const cpB = Array.from(b).map(c => c.codePointAt(0));
-    const len = Math.min(cpA.length, cpB.length);
-    for (let i = 0; i < len; i++) {
-        if (cpA[i] !== cpB[i]) return cpA[i] - cpB[i];
-    }
-    return cpA.length - cpB.length;
-}
-
 export function normalizeQuery(queryInput) {
     if (!queryInput) return "";
-    let searchParams;
-
-    if (typeof queryInput === "string") {
-        const clean = queryInput.startsWith("?") ? queryInput.slice(1) : queryInput;
-        searchParams = new URLSearchParams(clean);
-    } else if (typeof URLSearchParams !== "undefined" && queryInput instanceof URLSearchParams) {
-        searchParams = queryInput;
-    } else if (typeof queryInput === "object") {
-        searchParams = new URLSearchParams();
-        for (const [k, v] of Object.entries(queryInput)) {
-            if (Array.isArray(v)) {
-                v.forEach(val => searchParams.append(k, String(val)));
-            } else if (v !== undefined && v !== null) {
-                searchParams.append(k, String(v));
-            }
-        }
-    } else {
-        return "";
-    }
-
+    let searchParams = typeof queryInput === "string" ? new URLSearchParams(queryInput.startsWith("?") ? queryInput.slice(1) : queryInput) : queryInput;
     const params = [];
-    searchParams.forEach((val, key) => {
-        params.push([key, val]);
-    });
-    params.sort((a, b) => {
-        const keyCmp = codePointCompare(a[0], b[0]);
-        if (keyCmp !== 0) return keyCmp;
-        return codePointCompare(a[1], b[1]);
-    });
+    searchParams.forEach((val, key) => params.push([key, val]));
+    params.sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : a[1] < b[1] ? -1 : a[1] > b[1] ? 1 : 0));
     return params.map(([k, v]) => `${rfc3986Encode(k)}=${rfc3986Encode(v)}`).join("&");
 }
 
-export function buildCanonicalPayload(host, method, path, query, timestamp, counter, bodyHash) {
+export function buildCanonicalPayload(host, method, path, query, timestamp, counter, bodyHash, contentType = "") {
     const normHost = normalizeHost(host);
     const normMethod = method.trim().toUpperCase();
     const normPath = normalizePath(path);
     const normQuery = normalizeQuery(query);
+    const normCt = normalizeContentType(contentType);
 
-    const components = [normHost, normMethod, normPath, normQuery, timestamp.toString(), `counter:${counter.toString()}`, bodyHash];
+    const components = [
+        normHost,
+        normMethod,
+        normPath,
+        normQuery,
+        timestamp.toString(),
+        `counter:${counter.toString()}`,
+        normCt,
+        bodyHash
+    ];
     return components.map(c => `${new TextEncoder().encode(c).length}:${c}\n`).join('');
 }
 
-export function buildSyncCanonicalPayload(host, method, path, query, timestamp, syncNonce, bodyHash) {
+export function buildSyncCanonicalPayload(host, method, path, query, timestamp, syncNonce, bodyHash, contentType = "") {
     const normHost = normalizeHost(host);
     const normMethod = method.trim().toUpperCase();
     const normPath = normalizePath(path);
     const normQuery = normalizeQuery(query);
+    const normCt = normalizeContentType(contentType);
 
-    const components = [normHost, normMethod, normPath, normQuery, timestamp.toString(), `sync:${syncNonce}`, bodyHash];
+    const components = [
+        normHost,
+        normMethod,
+        normPath,
+        normQuery,
+        timestamp.toString(),
+        `sync:${syncNonce}`,
+        normCt,
+        bodyHash
+    ];
     return components.map(c => `${new TextEncoder().encode(c).length}:${c}\n`).join('');
 }
 
 async function serializeBody(body, explicitContentType) {
     if (body === undefined || body === null) {
-        return { bodyBytes: new Uint8Array(0), inferredContentType: null };
-    }
-    if (typeof ReadableStream !== "undefined" && body instanceof ReadableStream) {
-        throw new Error("ReadableStream cannot be signed deterministically; buffer into Uint8Array first.");
+        return { bodyBytes: new Uint8Array(0), inferredContentType: explicitContentType || "" };
     }
     if (typeof body === "string") {
-        return {
-            bodyBytes: new TextEncoder().encode(body),
-            inferredContentType: explicitContentType || "application/json"
-        };
+        return { bodyBytes: new TextEncoder().encode(body), inferredContentType: explicitContentType || "application/json" };
     }
     if (body instanceof Uint8Array) {
         return { bodyBytes: body, inferredContentType: explicitContentType || "application/octet-stream" };
     }
-    if (body instanceof ArrayBuffer) {
-        return { bodyBytes: new Uint8Array(body), inferredContentType: explicitContentType || "application/octet-stream" };
-    }
-    if (typeof Blob !== "undefined" && body instanceof Blob) {
-        return { bodyBytes: new Uint8Array(await body.arrayBuffer()), inferredContentType: explicitContentType || body.type || "application/octet-stream" };
-    }
-    if (typeof URLSearchParams !== "undefined" && body instanceof URLSearchParams) {
-        return { bodyBytes: new TextEncoder().encode(body.toString()), inferredContentType: "application/x-www-form-urlencoded;charset=UTF-8" };
-    }
-    if (typeof FormData !== "undefined" && body instanceof FormData) {
-        throw new Error("FormData cannot be signed deterministically; convert to JSON or binary bytes first.");
-    }
-    return { bodyBytes: new TextEncoder().encode(JSON.stringify(body)), inferredContentType: "application/json" };
+    return { bodyBytes: new TextEncoder().encode(JSON.stringify(body)), inferredContentType: explicitContentType || "application/json" };
 }
 
 export async function fetchWithAuth(url, options = {}, userId, maxRetries = 3) {
@@ -372,8 +211,8 @@ async function executeRequest(url, options, userId, retryCount = 0, maxRetries =
 
     const nonceCounter = await counterMutex.acquireCounter(userId);
 
-    const existingHeaders = new Headers(options.headers || {});
-    const explicitContentType = existingHeaders.get("Content-Type");
+    const requestHeaders = new Headers(options.headers || {});
+    const explicitContentType = requestHeaders.get("Content-Type") || "";
 
     const { bodyBytes, inferredContentType } = await serializeBody(options.body, explicitContentType);
     const bodyHashBuffer = await window.crypto.subtle.digest('SHA-256', bodyBytes);
@@ -381,21 +220,21 @@ async function executeRequest(url, options, userId, retryCount = 0, maxRetries =
         .map(b => b.toString(16).padStart(2, '0'))
         .join('');
 
-    const payload = buildCanonicalPayload(host, method, path, query, timestamp, nonceCounter, bodyHash);
+    const payload = buildCanonicalPayload(host, method, path, query, timestamp, nonceCounter, bodyHash, inferredContentType);
     const signature = await signPayload(userId, payload);
 
-    existingHeaders.set("X-User-Id", userId);
-    existingHeaders.set("X-Timestamp", timestamp.toString());
-    existingHeaders.set("X-Nonce-Counter", nonceCounter.toString());
-    existingHeaders.set("X-Signature", signature);
+    requestHeaders.set("X-User-Id", userId);
+    requestHeaders.set("X-Timestamp", timestamp.toString());
+    requestHeaders.set("X-Nonce-Counter", nonceCounter.toString());
+    requestHeaders.set("X-Signature", signature);
 
-    if (inferredContentType && !existingHeaders.has("Content-Type")) {
-        existingHeaders.set("Content-Type", inferredContentType);
+    if (inferredContentType && !requestHeaders.has("Content-Type")) {
+        requestHeaders.set("Content-Type", inferredContentType);
     }
 
     const fetchOptions = {
         ...options,
-        headers: existingHeaders,
+        headers: requestHeaders,
         body: (method !== "GET" && method !== "HEAD" && bodyBytes.byteLength > 0) ? bodyBytes : undefined
     };
 
@@ -421,7 +260,7 @@ export async function syncNonceWithServer(url, userId) {
     const syncNonce = generateRandomNonce(16);
 
     const bodyHash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
-    const payload = buildSyncCanonicalPayload(host, "GET", path, query, timestamp, syncNonce, bodyHash);
+    const payload = buildSyncCanonicalPayload(host, "GET", path, query, timestamp, syncNonce, bodyHash, "");
     const signature = await signPayload(userId, payload);
 
     const headers = new Headers({

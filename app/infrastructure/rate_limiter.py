@@ -15,10 +15,6 @@ class SlidingWindowRateLimiter:
         self._lock = threading.Lock()
 
     def is_allowed(self, key: str) -> Tuple[bool, int]:
-        """
-        Evaluates whether key is within rate allowance.
-        Returns (is_allowed, retry_after_seconds).
-        """
         now = time.monotonic()
         cutoff = now - self.window_seconds
 
@@ -34,7 +30,6 @@ class SlidingWindowRateLimiter:
 
             if len(valid_timestamps) < self.limit:
                 if key not in self._history and len(self._history) >= self.max_keys:
-                    # Emergency sweep of expired keys
                     keys_to_delete = [k for k, v in self._history.items() if not v or v[-1] <= cutoff]
                     for k in keys_to_delete:
                         del self._history[k]
@@ -49,7 +44,6 @@ class SlidingWindowRateLimiter:
             return False, retry_after
 
     def reset(self) -> None:
-        """Clears all tracked sliding window timestamps."""
         with self._lock:
             self._history.clear()
 
@@ -63,7 +57,6 @@ default_auth_limiter = SlidingWindowRateLimiter(
 
 
 def reset_rate_limiters() -> None:
-    """Resets shared in-memory rate limiter states for test isolation."""
     default_general_limiter.reset()
     default_auth_limiter.reset()
 
@@ -74,22 +67,39 @@ def resolve_client_ip(
     trust_proxy_headers: bool,
     trusted_proxies: Sequence[str]
 ) -> str:
-    """Extracts client IP taking into account trusted proxy headers."""
-    if trust_proxy_headers and direct_ip in trusted_proxies:
-        for name, value in headers:
-            if name.lower() == b"x-forwarded-for":
-                forwarded = value.decode("latin-1", errors="ignore")
-                client_ip = forwarded.split(",")[0].strip()
-                if client_ip:
-                    return client_ip
-    return direct_ip
+    """
+    Extracts client IP by traversing the X-Forwarded-For chain from right to left,
+    stripping configured trusted proxies to prevent header spoofing rate limiter bypasses.
+    """
+    if not trust_proxy_headers:
+        return direct_ip
+
+    if direct_ip not in trusted_proxies:
+        return direct_ip
+
+    xff_raw = None
+    for name, value in headers:
+        if name.lower() == b"x-forwarded-for":
+            xff_raw = value.decode("latin-1", errors="ignore")
+            break
+
+    if not xff_raw:
+        return direct_ip
+
+    ips = [ip.strip() for ip in xff_raw.split(",") if ip.strip()]
+    if not ips:
+        return direct_ip
+
+    # Traverse from right to left (most recently appended)
+    for ip in reversed(ips):
+        if ip not in trusted_proxies:
+            return ip
+
+    return ips[0]
 
 
 class RateLimitMiddleware:
-    """
-    ASGI middleware providing admission control and DoS mitigation.
-    Throttles strictly by canonical client IP address to prevent header spoofing DoS.
-    """
+    """ASGI middleware providing DoS mitigation based on verified client IP."""
     def __init__(
         self,
         app: ASGIApp,
@@ -121,7 +131,7 @@ class RateLimitMiddleware:
         )
 
         path = scope.get("path", "")
-        if path.startswith("/auth/"):
+        if path == "/auth" or path.startswith("/auth/"):
             rate_key = f"auth:{client_ip}"
             allowed, retry_after = self.auth_limiter.is_allowed(rate_key)
         else:

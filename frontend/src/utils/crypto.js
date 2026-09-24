@@ -9,7 +9,7 @@ export async function getDB() {
         return dbInstancePromise;
     }
     dbInstancePromise = new Promise((resolve, reject) => {
-        const request = indexedDB.open(DB_NAME, 4);
+        const request = indexedDB.open(DB_NAME, 5);
         request.onupgradeneeded = (event) => {
             const db = event.target.result;
             if (!db.objectStoreNames.contains(KEY_STORE_NAME)) {
@@ -54,12 +54,6 @@ export function uint8ArrayToBase64(bytes) {
     return btoa(binary);
 }
 
-/**
- * Generates a cryptographically secure random hexadecimal nonce.
- * Clamps byte count to 8-32 bytes producing 16-64 hex characters to adhere to API constraints.
- * @param {number} byteLength - Number of random bytes (default 16 bytes = 32 hex chars).
- * @returns {string} Hexadecimal string representation.
- */
 export function generateRandomNonce(byteLength = 16) {
     const clampedBytes = Math.max(8, Math.min(32, byteLength));
     const bytes = new Uint8Array(clampedBytes);
@@ -67,22 +61,26 @@ export function generateRandomNonce(byteLength = 16) {
     return Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
 }
 
-export async function generateKey() {
-    const algorithm = "RSA-PSS-SHA256";
+export async function generateEd25519Key() {
+    const algorithm = "Ed25519";
     const keyPair = await window.crypto.subtle.generateKey(
-        {
-            name: "RSA-PSS",
-            modulusLength: 2048,
-            publicExponent: new Uint8Array([1, 0, 1]),
-            hash: "SHA-256",
-        },
-        false,
+        { name: "Ed25519" },
+        false, // Private key remains non-extractable via Web Crypto API
         ["sign", "verify"]
     );
 
-    const spki = await window.crypto.subtle.exportKey("spki", keyPair.publicKey);
-    const rawKeyBytes = new Uint8Array(spki);
-    const b64 = uint8ArrayToBase64(rawKeyBytes);
+    let rawKeyBytes;
+    try {
+        const rawBuffer = await window.crypto.subtle.exportKey("raw", keyPair.publicKey);
+        rawKeyBytes = new Uint8Array(rawBuffer);
+    } catch {
+        const spkiBuffer = await window.crypto.subtle.exportKey("spki", keyPair.publicKey);
+        const spkiBytes = new Uint8Array(spkiBuffer);
+        rawKeyBytes = spkiBytes.length === 44 ? spkiBytes.slice(12) : spkiBytes;
+    }
+
+    const spkiBuffer = await window.crypto.subtle.exportKey("spki", keyPair.publicKey);
+    const b64 = uint8ArrayToBase64(new Uint8Array(spkiBuffer));
     const exportedPubKey = `-----BEGIN PUBLIC KEY-----\n${b64.match(/.{1,64}/g).join('\n')}\n-----END PUBLIC KEY-----`;
 
     return { keyPair, exportedPubKey, rawKeyBytes, algorithm };
@@ -95,7 +93,7 @@ export async function signRegistrationProof(privateKey, algorithm, canonicalKeyB
 
     const data = new TextEncoder().encode(challenge);
     const signature = await window.crypto.subtle.sign(
-        { name: "RSA-PSS", saltLength: 32 },
+        { name: "Ed25519" },
         privateKey,
         data
     );
@@ -112,34 +110,12 @@ export async function storeKey(userId, keyPair, algorithm) {
         tx.onerror = () => reject(tx.error);
         tx.onabort = () => reject(new Error("IndexedDB transaction aborted"));
 
+        const privateKey = (keyPair && keyPair.privateKey) ? keyPair.privateKey : keyPair;
         store.put({
             id: userId,
-            privateKey: keyPair.privateKey,
+            privateKey,
             algorithm
         });
-    });
-}
-
-export async function getStoredCounter(userId) {
-    const db = await getDB();
-    return new Promise((resolve, reject) => {
-        const tx = db.transaction(COUNTER_STORE_NAME, "readonly");
-        const store = tx.objectStore(COUNTER_STORE_NAME);
-        const req = store.get(userId);
-
-        req.onsuccess = () => {
-            if (!req.result || req.result.counter === undefined || req.result.counter === null) {
-                resolve(1n);
-            } else {
-                try {
-                    resolve(BigInt(req.result.counter));
-                } catch {
-                    resolve(1n);
-                }
-            }
-        };
-        req.onerror = () => reject(req.error);
-        tx.onabort = () => reject(new Error("IndexedDB transaction aborted"));
     });
 }
 
@@ -186,7 +162,6 @@ export async function setStoredCounter(userId, counter) {
                 }
             }
             const counterBigInt = BigInt(counter);
-            // Strict monotonicity guarantee: never roll back to a lower counter
             if (counterBigInt > current) {
                 const putReq = store.put({ id: userId, counter: counterBigInt.toString() });
                 putReq.onsuccess = () => resolve();
@@ -216,7 +191,7 @@ export async function signPayload(userId, payload) {
 
     const data = new TextEncoder().encode(payload);
     const signature = await window.crypto.subtle.sign(
-        { name: "RSA-PSS", saltLength: 32 },
+        { name: "Ed25519" },
         keyRecord.privateKey,
         data
     );

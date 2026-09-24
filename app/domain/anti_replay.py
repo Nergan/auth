@@ -2,62 +2,76 @@ import re
 from typing import Tuple, List, Sequence, Union, Mapping, Any
 from urllib.parse import parse_qsl, quote
 
-SLIDING_WINDOW_SIZE = 64  # 64-bit window
 UNRESERVED_CHARS = set(b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.~")
 
 
-def evaluate_sliding_window(
-    base: int,
-    mask: int,
+def evaluate_sliding_replay_window(
+    current_base: int,
+    current_mask: int,
     presented: int,
-    window_size: int = SLIDING_WINDOW_SIZE,
-    max_forward_window: int = 100
-) -> Tuple[bool, int, int, str]:
+    max_forward_jump: int = 100,
+    window_size: int = 64
+) -> Tuple[bool, int, str, int, int]:
     """
-    RFC 6479 bitmask sliding window anti-replay evaluation.
-    Returns (is_valid, new_base, new_mask, error_reason).
+    RFC 6479-compliant sliding replay window evaluation.
+    Tracks received sequence numbers using a bitmask to support out-of-order execution.
+    Returns (is_valid, expected_base, error_reason, new_base, new_mask).
     """
     if presented <= 0:
-        return False, base, mask, "invalid_counter_range"
+        return False, current_base + 1, "invalid_counter_range", current_base, current_mask
 
-    if base == 0:
-        if presented > max_forward_window:
-            return False, base, mask, "forward_jump_too_large"
-        return True, presented, 0, ""
+    if presented > current_base + max_forward_jump:
+        return False, current_base + 1, "forward_jump_too_large", current_base, current_mask
 
-    if presented > base:
-        delta = presented - base
-        if delta > max_forward_window:
-            return False, base, mask, "forward_jump_too_large"
-
-        if delta > window_size:
-            new_mask = 0
+    # Case 1: Sequence advances ahead of current max sequence
+    if presented > current_base:
+        diff = presented - current_base
+        if diff >= window_size:
+            new_mask = 1
         else:
-            new_mask = ((mask << delta) | (1 << (delta - 1))) & ((1 << window_size) - 1)
+            new_mask = ((current_mask << diff) | 1) & ((1 << window_size) - 1)
+        return True, presented + 1, "", presented, new_mask
 
-        return True, presented, new_mask, ""
+    # Case 2: Sequence falls inside the sliding window
+    diff = current_base - presented
+    if diff >= window_size:
+        return False, current_base + 1, "replay_detected", current_base, current_mask
 
-    if presented == base:
-        return False, base, mask, "replay_detected"
+    if (current_mask >> diff) & 1:
+        return False, current_base + 1, "replay_detected", current_base, current_mask
 
-    # presented < base
-    delta = base - presented
-    if delta > window_size:
-        return False, base, mask, "counter_too_old"
+    # Out-of-order counter accepted within window
+    new_mask = current_mask | (1 << diff)
+    return True, current_base + 1, "", current_base, new_mask
 
-    bit_index = delta - 1
-    if (mask & (1 << bit_index)) != 0:
-        return False, base, mask, "replay_detected"
 
-    new_mask = mask | (1 << bit_index)
-    return True, base, new_mask, ""
+def normalize_content_type(content_type: str) -> str:
+    """
+    Deterministic Content-Type normalization according to RFC 9110 media-type specs.
+    Extracts essence and sorts media parameters alphabetically.
+    """
+    if not content_type:
+        return ""
+    parts = [p.strip() for p in content_type.split(";") if p.strip()]
+    if not parts:
+        return ""
+
+    essence = parts[0].lower()
+    params = []
+    for p in parts[1:]:
+        if "=" in p:
+            k, v = p.split("=", 1)
+            params.append((k.strip().lower(), v.strip().strip('"')))
+
+    params.sort(key=lambda item: item[0])
+    if not params:
+        return essence
+
+    param_str = ";".join(f"{k}={v}" for k, v in params)
+    return f"{essence};{param_str}"
 
 
 def normalize_host(host: str) -> str:
-    """
-    Standardizes host strings by stripping default ports (80/443) and lowercasing.
-    Handles IPv6 bracketed literals and standard hostname/IPv4 formats.
-    """
     if not host:
         return ""
     host_clean = host.strip().lower()
@@ -79,19 +93,37 @@ def normalize_host(host: str) -> str:
     return host_clean
 
 
+def is_host_trusted(host: str, trusted_hosts: Sequence[str]) -> bool:
+    if "*" in trusted_hosts:
+        return True
+    if not host:
+        return False
+
+    norm_host = normalize_host(host)
+    norm_hostname = norm_host
+    if norm_host.startswith("["):
+        if "]" in norm_host:
+            norm_hostname = norm_host[:norm_host.index("]") + 1]
+    elif ":" in norm_host:
+        norm_hostname = norm_host.split(":", 1)[0]
+
+    for th in trusted_hosts:
+        th_norm = normalize_host(th)
+        if norm_host == th_norm:
+            return True
+        if ":" not in th_norm and norm_hostname == th_norm:
+            return True
+
+    return False
+
+
 def resolve_host(
     headers: Union[Mapping[str, Any], Sequence[Tuple[bytes, bytes]], Any],
     client_ip: str = "",
     trust_proxy_headers: bool = False,
     trusted_proxies: Sequence[str] = ()
 ) -> str:
-    """
-    Resolves canonical request host taking into account HTTP/2 authority,
-    Host header, and X-Forwarded-Host when proxy trust is established.
-    Accepts Starlette Headers, Mapping/dict instances, or ASGI raw header sequences.
-    """
     header_map: dict[str, str] = {}
-
     if hasattr(headers, "items"):
         for k, v in headers.items():
             k_str = k.decode("latin-1").lower() if isinstance(k, bytes) else str(k).lower()
@@ -117,24 +149,11 @@ def resolve_host(
     return normalize_host(raw_host)
 
 
-def is_host_trusted(host: str, trusted_hosts: Sequence[str]) -> bool:
-    """Validates whether normalized host matches configured trusted host patterns."""
-    if "*" in trusted_hosts:
-        return True
-    if not host:
-        return False
-    clean_host = normalize_host(host)
-    return clean_host in trusted_hosts
-
-
 def remove_dot_segments(path: str) -> str:
-    """Removes relative dot segments '.' and '..' according to RFC 3986 Section 5.2.4."""
     if not path:
         return "/"
-
     input_buffer = path
     output_segments: List[str] = []
-
     while input_buffer:
         if input_buffer.startswith("../"):
             input_buffer = input_buffer[3:]
@@ -158,63 +177,39 @@ def remove_dot_segments(path: str) -> str:
             if input_buffer.startswith("/"):
                 next_slash = input_buffer.find("/", 1)
                 if next_slash != -1:
-                    segment = input_buffer[:next_slash]
-                    input_buffer = input_buffer[next_slash:]
+                    segment, input_buffer = input_buffer[:next_slash], input_buffer[next_slash:]
                 else:
-                    segment = input_buffer
-                    input_buffer = ""
+                    segment, input_buffer = input_buffer, ""
             else:
                 next_slash = input_buffer.find("/")
                 if next_slash != -1:
-                    segment = input_buffer[:next_slash]
-                    input_buffer = input_buffer[next_slash:]
+                    segment, input_buffer = input_buffer[:next_slash], input_buffer[next_slash:]
                 else:
-                    segment = input_buffer
-                    input_buffer = ""
+                    segment, input_buffer = input_buffer, ""
             output_segments.append(segment)
-
     result = "".join(output_segments)
-    if not result.startswith("/"):
-        result = "/" + result
-    return result
+    return result if result.startswith("/") else "/" + result
 
 
 def normalize_percent_encoding(text: str) -> str:
-    """
-    Decodes RFC 3986 unreserved percent-encoded characters and uppercases remaining hex triplets.
-    """
     def _replace_pct(match: re.Match) -> str:
-        hex_val = match.group(1)
-        byte_val = int(hex_val, 16)
-        if byte_val in UNRESERVED_CHARS:
-            return chr(byte_val)
-        return f"%{hex_val.upper()}"
-
+        byte_val = int(match.group(1), 16)
+        return chr(byte_val) if byte_val in UNRESERVED_CHARS else f"%{match.group(1).upper()}"
     return re.sub(r"%([0-9a-fA-F]{2})", _replace_pct, text)
 
 
 def normalize_path(path: str) -> str:
-    """
-    Normalizes URL path by decoding unreserved characters first, resolving dot segments,
-    collapsing duplicate slashes, ensuring a leading slash, and canonicalizing hex encodings.
-    """
     if not path:
         return "/"
-    clean_path = path.strip()
-    # Step 1: Decode unreserved percent-encoded characters (including %2e -> '.')
-    clean_path = normalize_percent_encoding(clean_path)
-    # Step 2: Remove dot segments on decoded path
+    clean_path = normalize_percent_encoding(path.strip())
     clean_path = remove_dot_segments(clean_path)
-    # Step 3: Collapse redundant duplicate slashes
     clean_path = re.sub(r"/+", "/", clean_path)
     if not clean_path.startswith("/"):
         clean_path = "/" + clean_path
-    # Step 4: Uppercase remaining valid percent-encodings
     return normalize_percent_encoding(clean_path)
 
 
 def normalize_query(query: str) -> str:
-    """Sorts query parameters lexicographically by key and value using RFC 3986 percent-encoding."""
     if not query:
         return ""
     pairs: List[Tuple[str, str]] = parse_qsl(query, keep_blank_values=True)

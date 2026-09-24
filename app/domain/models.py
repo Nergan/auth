@@ -5,7 +5,10 @@ from pydantic import BaseModel, Field
 
 
 class KeyAlgorithm(str, Enum):
-    RSA_PSS_SHA256 = "RSA-PSS-SHA256"
+    ED25519 = "Ed25519"
+    ML_DSA_44 = "ML-DSA-44"  # NIST FIPS 204 (Category 2)
+    ML_DSA_65 = "ML-DSA-65"  # NIST FIPS 204 (Category 3)
+    ML_DSA_87 = "ML-DSA-87"  # NIST FIPS 204 (Category 5)
 
 
 class ErrorDetail(BaseModel):
@@ -22,25 +25,19 @@ class ErrorResponse(BaseModel):
 
 
 class UserRegister(BaseModel):
-    public_key: str = Field(..., max_length=10000, description="PEM formatted RSA public key (2048 bits)")
-    key_algorithm: KeyAlgorithm = Field(default=KeyAlgorithm.RSA_PSS_SHA256)
+    public_key: str = Field(..., max_length=25000, description="PEM, Base64, or Hex encoded public key")
+    key_algorithm: KeyAlgorithm = Field(default=KeyAlgorithm.ED25519)
     timestamp: int = Field(..., description="Unix epoch timestamp in seconds for freshness validation")
-    client_nonce: str = Field(
-        ...,
-        min_length=16,
-        max_length=64,
-        pattern=r"^[a-zA-Z0-9_-]+$",
-        description="Unique random challenge token (alphanumeric/url-safe)"
-    )
-    proof_signature: str = Field(..., description="Base64 signature proving ownership of the private key")
+    client_nonce: str = Field(..., min_length=16, max_length=64, pattern=r"^[a-zA-Z0-9_-]+$")
+    proof_signature: str = Field(..., description="Base64 deterministic signature proving key possession")
 
 
 class UserEntity(BaseModel):
     user_id: str
     public_key: str
     key_algorithm: KeyAlgorithm
-    nonce_base: int = 0
-    nonce_mask: int = 0
+    nonce_base: int = 0  # Represents highest seen counter (N_max)
+    nonce_mask: int = 0  # Sliding window bitmask
     created_at: datetime
 
 
@@ -51,7 +48,9 @@ class UserResponse(BaseModel):
 
 class NonceSyncResponse(BaseModel):
     user_id: str
-    nonce_counter: int
+    last_successful_nonce: int
+    next_expected_nonce: int
+    nonce_counter: int  # Compatibility alias for next_expected_nonce
 
 
 class ProtectedData(BaseModel):

@@ -18,6 +18,7 @@ class Settings(BaseSettings):
     max_request_body_bytes: int = 5 * 1024 * 1024  # 5 MB limit
     timestamp_tolerance_seconds: int = 120
     max_counter_window: int = 100  # Bounds forward jumps to prevent counter exhaustion DoS
+    replay_window_size: int = 64  # Sliding window bitmask size for out-of-order concurrent requests
     crypto_max_workers: int = Field(default_factory=lambda: max(4, os.cpu_count() or 4))
     crypto_timeout_seconds: float = 5.0
     sync_nonce_ttl_seconds: int = 300
