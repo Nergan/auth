@@ -34,6 +34,35 @@ jobs:
             exit 1
           fi
 
+          if ! getent hosts codeberg.org >/dev/null 2>&1; then
+            ip="$(python3 - << 'PY'
+          import json, urllib.request
+
+          urls = (
+              "https://dns.google/resolve?name=codeberg.org&type=A",
+              "https://cloudflare-dns.com/dns-query?name=codeberg.org&type=A",
+          )
+          for url in urls:
+              req = urllib.request.Request(url, headers={"Accept": "application/dns-json", "User-Agent": "github-mirror"})
+              try:
+                  with urllib.request.urlopen(req, timeout=20) as response:
+                      payload = json.load(response)
+              except OSError:
+                  continue
+              for answer in payload.get("Answer", []):
+                  if answer.get("type") == 1 and answer.get("data"):
+                      print(answer["data"])
+                      raise SystemExit(0)
+          PY
+            )"
+            if [ -z "${ip}" ]; then
+              echo "Could not resolve codeberg.org."
+              exit 1
+            fi
+            echo "${ip} codeberg.org" | sudo tee -a /etc/hosts >/dev/null
+            echo "Pinned codeberg.org because the runner DNS did not answer."
+          fi
+
           python3 - << 'PY'
           import json, os, urllib.error, urllib.parse, urllib.request
 
